@@ -211,8 +211,22 @@ function App() {
               </label>
               <input value={session.title} onChange={(event) => updateSession(session.id, "title", event.target.value)} />
               <div className="session-card-grid">
-                <input type="datetime-local" value={toLocalInput(session.start)} onChange={(event) => updateSession(session.id, "start", new Date(event.target.value).toISOString())} />
-                <input type="datetime-local" value={toLocalInput(session.end)} onChange={(event) => updateSession(session.id, "end", new Date(event.target.value).toISOString())} />
+                <input
+                  type="datetime-local"
+                  value={toLocalInput(session.start)}
+                  onChange={(event) => {
+                    if (!event.target.value) return;
+                    updateSession(session.id, "start", new Date(event.target.value).toISOString());
+                  }}
+                />
+                <input
+                  type="datetime-local"
+                  value={toLocalInput(session.end)}
+                  onChange={(event) => {
+                    if (!event.target.value) return;
+                    updateSession(session.id, "end", new Date(event.target.value).toISOString());
+                  }}
+                />
               </div>
               <p>{session.rationale}</p>
               <span className="pill"><Clock size={14} /> {durationHours(session).toFixed(1)}h · {session.priority} · {(session.confidence * 100).toFixed(0)}%</span>
@@ -307,6 +321,7 @@ function durationHours(session) {
 
 function toLocalInput(value) {
   const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
   const offset = date.getTimezoneOffset();
   return new Date(date.getTime() - offset * 60_000).toISOString().slice(0, 16);
 }

@@ -38,6 +38,10 @@ app.get("/api/auth/google", (_req, res) => {
 
 app.get("/api/auth/google/callback", async (req, res, next) => {
   try {
+    if (!req.query.code) {
+      res.status(400).json({ error: "Missing Google OAuth authorization code." });
+      return;
+    }
     await handleOAuthCallback(req.query.code);
     res.redirect(`${clientBaseUrl}?calendar=connected`);
   } catch (error) {

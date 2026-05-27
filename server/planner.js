@@ -94,7 +94,7 @@ function buildCandidateSlots(preferences, busyBlocks) {
     end: new Date(block.end)
   }));
 
-  for (let day = 0; day < 6; day += 1) {
+  for (let day = 0; day < 7; day += 1) {
     const cursor = new Date(weekStart);
     cursor.setDate(weekStart.getDate() + day);
     cursor.setHours(preferences.startHour, 0, 0, 0);
@@ -165,7 +165,11 @@ function normalizePreferences(preferences = {}) {
 }
 
 function overlapsAny(start, end, blocks) {
-  return blocks.some((block) => start < block.end && end > block.start);
+  return blocks.some((block) => {
+    const blockStart = new Date(block.start);
+    const blockEnd = new Date(block.end);
+    return start < blockEnd && end > blockStart;
+  });
 }
 
 function extractJson(value) {

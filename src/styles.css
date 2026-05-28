@@ -165,11 +165,19 @@ p {
 
 .planner-panel,
 .calendar-panel,
-.review-panel {
+.review-panel,
+.auth-gate {
   background: #fbfcfa;
   border: 1px solid #c8d8d2;
   border-radius: 8px;
   padding: 18px;
+}
+
+.auth-gate {
+  display: grid;
+  justify-items: start;
+  gap: 12px;
+  margin-bottom: 18px;
 }
 
 .goal-list,

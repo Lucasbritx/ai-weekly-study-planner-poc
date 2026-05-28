@@ -3,9 +3,21 @@ import cors from "cors";
 import express from "express";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { createStudyEvents, getAuthUrl, getConnectionStatus, handleOAuthCallback, listBusyBlocks } from "./googleCalendar.js";
+import { requireUser } from "./auth.js";
+import { createStudyEvents, getCalendarStatus, listBusyBlocks } from "./googleCalendar.js";
 import { generateStudyPlan } from "./planner.js";
 import { startOfWeek } from "./sampleData.js";
+import {
+  getGoals,
+  getLatestPlan,
+  getPreferences,
+  isPersistentStoreConfigured,
+  saveGoals,
+  saveGoogleConnection,
+  savePlan,
+  savePreferences,
+  upsertProfile
+} from "./store.js";
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
@@ -20,37 +32,88 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "ai-weekly-study-planner-poc" });
 });
 
-app.get("/api/status", (_req, res) => {
-  res.json(getConnectionStatus());
-});
-
-app.get("/api/auth/google", (_req, res) => {
-  const url = getAuthUrl();
-  if (!url) {
-    res.status(409).json({
-      error: "Google OAuth is not configured.",
-      hint: "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI in .env."
-    });
-    return;
-  }
-  res.redirect(url);
-});
-
-app.get("/api/auth/google/callback", async (req, res, next) => {
+app.get("/api/status", requireUser, async (req, res, next) => {
   try {
-    await handleOAuthCallback(req.query.code);
-    res.redirect(`${clientBaseUrl}?calendar=connected`);
+    await upsertProfile(req.user);
+    res.json({
+      authMode: req.authMode,
+      persistence: isPersistentStoreConfigured() ? "supabase" : "memory",
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        displayName: req.user.user_metadata?.full_name || req.user.user_metadata?.name || req.user.email
+      },
+      calendar: await getCalendarStatus(req.user.id)
+    });
   } catch (error) {
     next(error);
   }
 });
 
-app.get("/api/calendar/busy", async (_req, res, next) => {
+app.post("/api/auth/google-connection", requireUser, async (req, res, next) => {
+  try {
+    await upsertProfile(req.user);
+    const connection = await saveGoogleConnection(req.user.id, {
+      providerToken: req.body.providerToken,
+      providerRefreshToken: req.body.providerRefreshToken,
+      expiresAt: req.body.expiresAt,
+      expiresIn: req.body.expiresIn,
+      scope: req.body.scope,
+      scopes: req.body.scopes
+    });
+    res.json({
+      connected: connection.status === "connected",
+      reconnectRequired: connection.status === "needs_reconnect",
+      scopes: connection.scopes
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/bootstrap", requireUser, async (req, res, next) => {
+  try {
+    await upsertProfile(req.user);
+    const [goals, preferences, latestPlan, calendar] = await Promise.all([
+      getGoals(req.user.id),
+      getPreferences(req.user.id),
+      getLatestPlan(req.user.id),
+      getCalendarStatus(req.user.id)
+    ]);
+    res.json({
+      goals,
+      preferences,
+      latestPlan,
+      calendar,
+      persistence: isPersistentStoreConfigured() ? "supabase" : "memory"
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/goals", requireUser, async (req, res, next) => {
+  try {
+    res.json({ goals: await saveGoals(req.user.id, req.body.goals || []) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/preferences", requireUser, async (req, res, next) => {
+  try {
+    res.json({ preferences: await savePreferences(req.user.id, req.body.preferences || {}) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/calendar/busy", requireUser, async (req, res, next) => {
   try {
     const weekStart = startOfWeek(new Date());
     const weekEnd = new Date(weekStart);
     weekEnd.setDate(weekStart.getDate() + 7);
-    const result = await listBusyBlocks({
+    const result = await listBusyBlocks(req.user.id, {
       timeMin: weekStart.toISOString(),
       timeMax: weekEnd.toISOString()
     });
@@ -60,20 +123,30 @@ app.get("/api/calendar/busy", async (_req, res, next) => {
   }
 });
 
-app.post("/api/plan", async (req, res, next) => {
+app.post("/api/plan", requireUser, async (req, res, next) => {
   try {
+    await upsertProfile(req.user);
+    const persistedGoals = await saveGoals(req.user.id, req.body.goals || []);
+    const persistedPreferences = await savePreferences(req.user.id, req.body.preferences || {});
     const weekStart = startOfWeek(new Date());
     const weekEnd = new Date(weekStart);
     weekEnd.setDate(weekStart.getDate() + 7);
-    const calendar = await listBusyBlocks({
+    const calendar = await listBusyBlocks(req.user.id, {
       timeMin: weekStart.toISOString(),
       timeMax: weekEnd.toISOString()
     });
     const plan = await generateStudyPlan({
-      goals: req.body.goals,
-      preferences: req.body.preferences,
+      goals: persistedGoals,
+      preferences: persistedPreferences,
       busyBlocks: calendar.busyBlocks,
       timezone: req.body.timezone
+    });
+    await savePlan(req.user.id, {
+      weekStart,
+      weekEnd,
+      source: plan.source,
+      calendarMode: calendar.mode,
+      sessions: plan.sessions
     });
     res.json({
       ...plan,
@@ -85,14 +158,14 @@ app.post("/api/plan", async (req, res, next) => {
   }
 });
 
-app.post("/api/calendar/events", async (req, res, next) => {
+app.post("/api/calendar/events", requireUser, async (req, res, next) => {
   try {
     const sessions = Array.isArray(req.body.sessions) ? req.body.sessions : [];
     if (!sessions.length) {
       res.status(400).json({ error: "No sessions selected for calendar creation." });
       return;
     }
-    res.json(await createStudyEvents(sessions));
+    res.json(await createStudyEvents(req.user.id, sessions));
   } catch (error) {
     next(error);
   }
@@ -110,7 +183,7 @@ app.get("*", (_req, res, next) => {
 
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(500).json({
+  res.status(error.status || 500).json({
     error: error.message || "Unexpected server error."
   });
 });

@@ -1,57 +1,24 @@
 import { google } from "googleapis";
 import { getMockBusyBlocks } from "./sampleData.js";
+import { getGoogleConnection, recordCreatedEvents } from "./store.js";
 
-const SCOPES = [
-  "openid",
-  "email",
-  "profile",
-  "https://www.googleapis.com/auth/calendar.events",
-  "https://www.googleapis.com/auth/calendar.freebusy"
-];
-
-const tokenStore = new Map();
-const createdEvents = [];
-
-export function getOAuthClient() {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
-
-  if (!clientId || !clientSecret || !redirectUri) {
-    return null;
-  }
-
-  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-}
-
-export function getAuthUrl() {
-  const client = getOAuthClient();
-  if (!client) return null;
-
-  return client.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: SCOPES
-  });
-}
-
-export async function handleOAuthCallback(code) {
-  const client = getOAuthClient();
-  if (!client) throw new Error("Google OAuth is not configured.");
-
-  const { tokens } = await client.getToken(code);
-  client.setCredentials(tokens);
-  tokenStore.set("demo-user", tokens);
-  return tokens;
-}
-
-export async function listBusyBlocks({ timeMin, timeMax }) {
-  const client = getAuthorizedClient();
+export async function listBusyBlocks(userId, { timeMin, timeMax }) {
+  const client = await getAuthorizedClient(userId);
   if (!client) {
     return {
       connected: false,
       busyBlocks: getMockBusyBlocks(),
-      mode: "mock"
+      mode: "mock",
+      reconnectRequired: false
+    };
+  }
+
+  if (client.reconnectRequired) {
+    return {
+      connected: false,
+      busyBlocks: getMockBusyBlocks(),
+      mode: "needs_reconnect",
+      reconnectRequired: true
     };
   }
 
@@ -68,6 +35,7 @@ export async function listBusyBlocks({ timeMin, timeMax }) {
   return {
     connected: true,
     mode: "google",
+    reconnectRequired: false,
     busyBlocks: busy.map((block, index) => ({
       id: `google-busy-${index}`,
       title: "Busy",
@@ -78,8 +46,8 @@ export async function listBusyBlocks({ timeMin, timeMax }) {
   };
 }
 
-export async function createStudyEvents(sessions) {
-  const client = getAuthorizedClient();
+export async function createStudyEvents(userId, sessions) {
+  const client = await getAuthorizedClient(userId);
   if (!client) {
     const saved = sessions.map((session) => ({
       ...session,
@@ -87,11 +55,17 @@ export async function createStudyEvents(sessions) {
       calendarEventId: `mock-event-${crypto.randomUUID()}`,
       htmlLink: null
     }));
-    createdEvents.push(...saved);
+    await recordCreatedEvents(userId, saved);
     return {
       mode: "mock",
       events: saved
     };
+  }
+
+  if (client.reconnectRequired) {
+    const error = new Error("Google Calendar needs to be reconnected before events can be created.");
+    error.status = 409;
+    throw error;
   }
 
   const calendar = google.calendar({ version: "v3", auth: client });
@@ -133,26 +107,41 @@ export async function createStudyEvents(sessions) {
     });
   }
 
-  createdEvents.push(...events);
+  await recordCreatedEvents(userId, events);
   return {
     mode: "google",
     events
   };
 }
 
-export function getConnectionStatus() {
+export async function getCalendarStatus(userId) {
+  const connection = await getGoogleConnection(userId);
+  const expired = isExpired(connection?.expiresAt);
   return {
-    connected: Boolean(getAuthorizedClient()),
-    configured: Boolean(getOAuthClient()),
-    createdEvents
+    connected: connection?.status === "connected" && !expired,
+    reconnectRequired: connection?.status === "needs_reconnect" || expired,
+    scopes: connection?.scopes || []
   };
 }
 
-function getAuthorizedClient() {
-  const client = getOAuthClient();
-  const tokens = tokenStore.get("demo-user");
-  if (!client || !tokens) return null;
+async function getAuthorizedClient(userId) {
+  const connection = await getGoogleConnection(userId);
+  if (!connection) return null;
+  if (connection.status === "needs_reconnect" || !connection.tokens?.providerToken || isExpired(connection.expiresAt)) {
+    return { reconnectRequired: true };
+  }
 
-  client.setCredentials(tokens);
+  const client = new google.auth.OAuth2();
+  client.setCredentials({
+    access_token: connection.tokens.providerToken,
+    refresh_token: connection.tokens.providerRefreshToken,
+    expiry_date: connection.expiresAt ? new Date(connection.expiresAt).getTime() : undefined
+  });
+
   return client;
+}
+
+function isExpired(expiresAt) {
+  if (!expiresAt) return false;
+  return new Date(expiresAt).getTime() < Date.now() + 60_000;
 }

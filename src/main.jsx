@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { CalendarCheck, Check, Clock, Edit3, GraduationCap, Loader2, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { CalendarCheck, Check, Clock, GraduationCap, Loader2, LogOut, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { supabase, supabaseConfigured } from "./supabaseClient";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8787";
@@ -12,7 +13,10 @@ const initialGoals = [
 ];
 
 function App() {
-  const [status, setStatus] = useState({ configured: false, connected: false });
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(!supabaseConfigured);
+  const [hydrated, setHydrated] = useState(false);
+  const [status, setStatus] = useState({ persistence: "memory", calendar: { connected: false } });
   const [busyBlocks, setBusyBlocks] = useState([]);
   const [calendarMode, setCalendarMode] = useState("mock");
   const [goals, setGoals] = useState(initialGoals);
@@ -29,31 +33,124 @@ function App() {
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    refreshCalendar();
-    fetch(`${API_BASE}/api/status`).then((res) => res.json()).then(setStatus).catch(() => {});
+    if (!supabaseConfigured) return;
+
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthReady(true);
+      if (data.session) syncGoogleConnection(data.session);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+      setAuthReady(true);
+      if (nextSession) syncGoogleConnection(nextSession);
+      if (!nextSession) {
+        setHydrated(false);
+        setSessions([]);
+        setSelected(new Set());
+      }
+    });
+
+    return () => listener.subscription.unsubscribe();
   }, []);
+
+  useEffect(() => {
+    if (!authReady) return;
+    if (supabaseConfigured && !session) return;
+    loadWorkspace();
+  }, [authReady, session?.access_token]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const timeout = setTimeout(() => {
+      apiFetch("/api/goals", {
+        method: "PUT",
+        body: JSON.stringify({ goals })
+      }).catch(() => {});
+    }, 450);
+    return () => clearTimeout(timeout);
+  }, [goals, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const timeout = setTimeout(() => {
+      apiFetch("/api/preferences", {
+        method: "PUT",
+        body: JSON.stringify({ preferences })
+      }).catch(() => {});
+    }, 450);
+    return () => clearTimeout(timeout);
+  }, [preferences, hydrated]);
 
   const weekDays = useMemo(() => buildWeekDays(), []);
   const totalDraftHours = sessions.reduce((sum, session) => sum + durationHours(session), 0);
+  const canUseApp = !supabaseConfigured || Boolean(session);
+
+  async function apiFetch(path, options = {}) {
+    const headers = {
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    };
+    if (session?.access_token) {
+      headers.Authorization = `Bearer ${session.access_token}`;
+    }
+
+    const response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Request failed.");
+    return data;
+  }
+
+  async function loadWorkspace() {
+    setLoading(true);
+    try {
+      const [bootstrap, calendar, nextStatus] = await Promise.all([
+        apiFetch("/api/bootstrap"),
+        apiFetch("/api/calendar/busy"),
+        apiFetch("/api/status")
+      ]);
+      setStatus(nextStatus);
+      setGoals(bootstrap.goals?.length ? bootstrap.goals : initialGoals);
+      setPreferences(bootstrap.preferences || preferences);
+      setCalendarMode(calendar.mode || "mock");
+      setBusyBlocks(calendar.busyBlocks || []);
+      if (bootstrap.latestPlan?.sessions?.length) {
+        setSessions(bootstrap.latestPlan.sessions);
+        setSelected(new Set(bootstrap.latestPlan.sessions.filter((session) => session.status !== "created").map((session) => session.id)));
+      }
+      setHydrated(true);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   async function refreshCalendar() {
-    const response = await fetch(`${API_BASE}/api/calendar/busy`);
-    const data = await response.json();
-    setBusyBlocks(data.busyBlocks || []);
-    setCalendarMode(data.mode || "mock");
+    try {
+      const data = await apiFetch("/api/calendar/busy");
+      setBusyBlocks(data.busyBlocks || []);
+      setCalendarMode(data.mode || "mock");
+      if (data.reconnectRequired) {
+        setMessage("Google Calendar needs to be reconnected to create real calendar events.");
+      }
+    } catch (error) {
+      setMessage(error.message);
+    }
   }
 
   async function generatePlan() {
     setLoading(true);
     setMessage("");
     try {
-      const response = await fetch(`${API_BASE}/api/plan`, {
+      const data = await apiFetch("/api/plan", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ goals, preferences, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone })
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not generate a plan.");
       setBusyBlocks(data.busyBlocks || busyBlocks);
       setCalendarMode(data.calendarMode || calendarMode);
       setSessions(data.sessions || []);
@@ -71,13 +168,10 @@ function App() {
     setLoading(true);
     setMessage("");
     try {
-      const response = await fetch(`${API_BASE}/api/calendar/events`, {
+      const data = await apiFetch("/api/calendar/events", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessions: approved })
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not create events.");
       const createdById = new Map(data.events.map((event) => [event.id, event]));
       setSessions((current) => current.map((session) => createdById.get(session.id) || session));
       setMessage(data.mode === "mock" ? "Events saved in mock mode. Connect Google Calendar to create real events." : "Selected events created in Google Calendar.");
@@ -85,6 +179,60 @@ function App() {
       setMessage(error.message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function signInWithGoogle() {
+    if (!supabaseConfigured) {
+      setMessage("Supabase env vars are missing, so the app is running in local demo mode.");
+      return;
+    }
+
+    await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: window.location.origin,
+        scopes: [
+          "https://www.googleapis.com/auth/calendar.events",
+          "https://www.googleapis.com/auth/calendar.freebusy"
+        ].join(" "),
+        queryParams: {
+          access_type: "offline",
+          prompt: "consent"
+        }
+      }
+    });
+  }
+
+  async function signOut() {
+    if (supabaseConfigured) await supabase.auth.signOut();
+  }
+
+  async function syncGoogleConnection(activeSession) {
+    if (!activeSession?.access_token || !activeSession.provider_token) return;
+
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/google-connection`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${activeSession.access_token}`
+        },
+        body: JSON.stringify({
+          providerToken: activeSession.provider_token,
+          providerRefreshToken: activeSession.provider_refresh_token,
+          expiresAt: activeSession.expires_at ? new Date(activeSession.expires_at * 1000).toISOString() : null,
+          scopes: [
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/calendar.freebusy"
+          ]
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not save Google connection.");
+      setStatus((current) => ({ ...current, calendar: data }));
+    } catch (error) {
+      setMessage(error.message);
     }
   }
 
@@ -120,9 +268,20 @@ function App() {
           <h1>Plan the week around the calendar you already have.</h1>
         </div>
         <div className="topbar-actions">
-          <a className="button secondary" href={`${API_BASE}/api/auth/google`}>
-            <CalendarCheck size={18} /> Connect Google
-          </a>
+          {session ? (
+            <>
+              <button className="button secondary" onClick={signInWithGoogle}>
+                <CalendarCheck size={18} /> Reconnect Google
+              </button>
+              <button className="button ghost" onClick={signOut}>
+                <LogOut size={17} /> Sign out
+              </button>
+            </>
+          ) : (
+            <button className="button secondary" onClick={signInWithGoogle}>
+              <CalendarCheck size={18} /> Sign in with Google
+            </button>
+          )}
           <button className="button ghost" onClick={refreshCalendar}>
             <RefreshCw size={17} /> Refresh
           </button>
@@ -130,13 +289,23 @@ function App() {
       </header>
 
       <section className="status-strip">
-        <StatusItem label="Calendar" value={calendarMode === "google" ? "Google connected" : "Mock mode"} />
-        <StatusItem label="OAuth config" value={status.configured ? "Configured" : "Missing .env"} />
+        <StatusItem label="Auth" value={supabaseConfigured ? (session ? "Signed in" : "Required") : "Demo mode"} />
+        <StatusItem label="Calendar" value={status.calendar?.reconnectRequired ? "Reconnect needed" : calendarMode === "google" ? "Google connected" : "Mock mode"} />
+        <StatusItem label="Persistence" value={status.persistence === "supabase" ? "Supabase" : "Memory"} />
         <StatusItem label="Draft hours" value={`${totalDraftHours.toFixed(1)}h / ${preferences.weeklyTargetHours}h target`} />
-        <StatusItem label="Approval" value={`${selected.size} selected`} />
       </section>
 
-      <div className="workspace">
+      {supabaseConfigured && !session && (
+        <section className="auth-gate">
+          <h2>Sign in to persist your planner</h2>
+          <p>Google sign-in creates your Supabase user and grants Calendar access for availability and approved study events.</p>
+          <button className="button primary" onClick={signInWithGoogle}>
+            <CalendarCheck size={18} /> Sign in with Google
+          </button>
+        </section>
+      )}
+
+      {canUseApp && <div className="workspace">
         <section className="planner-panel">
           <div className="panel-heading">
             <div>
@@ -192,9 +361,9 @@ function App() {
           </div>
           <CalendarGrid days={weekDays} busyBlocks={busyBlocks} sessions={sessions} selected={selected} onToggle={toggleSession} />
         </section>
-      </div>
+      </div>}
 
-      <section className="review-panel">
+      {canUseApp && <section className="review-panel">
         <div className="panel-heading">
           <div>
             <h2>Review draft sessions</h2>
@@ -219,7 +388,7 @@ function App() {
             </article>
           ))}
         </div>
-      </section>
+      </section>}
     </main>
   );
 }

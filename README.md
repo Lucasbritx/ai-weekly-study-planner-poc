@@ -71,3 +71,11 @@ USE_CODEX_SDK=true
 ```
 
 The server imports `Codex` from `@openai/codex-sdk`, starts a thread, asks for strict JSON, validates the response, and falls back to the local planner if the SDK call fails.
+
+## Next Steps
+
+- Replace the mock calendar fallback with a real signed-in Google Calendar demo flow.
+- Add persistence for saved goals, draft approvals, and created sessions.
+- Improve the planner with richer scheduling rules and conflict handling.
+- Add automated tests for the server routes and planner output.
+- Prepare a deployment target and document the production environment variables.
